@@ -189,6 +189,7 @@ const state = {
   active: null,
   query: "",
   smartsheetConfigured: false,
+  sharepointConfigured: false,
   message: "",
 };
 
@@ -222,9 +223,9 @@ function setTabs() {
 }
 
 function banner() {
-  const text = state.smartsheetConfigured
-    ? "Smartsheet sync is on. Saving an intake also adds a row to the sheet."
-    : "Answers are saved on this computer. Smartsheet can be connected later without changing the form.";
+  const text = state.sharepointConfigured
+    ? "Saving an intake also creates an item in the Patient Intake list on SharePoint."
+    : "Intakes are saved in the portal. SharePoint turns on when the Power Automate link is added.";
   return el("p", { className: "banner" }, [text]);
 }
 
@@ -257,6 +258,7 @@ async function loadStatus() {
     const response = await fetch("/api/status");
     const data = await response.json();
     state.smartsheetConfigured = Boolean(data.smartsheetConfigured);
+    state.sharepointConfigured = Boolean(data.sharepointConfigured);
   } catch {
     state.message = "The portal server is not running. Start it with: python server.py";
   }
@@ -485,10 +487,11 @@ async function onSubmit(event) {
   render();
 }
 
-function syncLabel(sync) {
-  if (!sync || sync.status === "skipped") return ["Saved locally", "warn"];
-  if (sync.status === "synced") return ["Sent to Smartsheet", "ok"];
-  return ["Smartsheet needs attention", "bad"];
+function syncLabel(intake) {
+  const sync = intake.sharepoint;
+  if (sync && sync.status === "synced") return ["Sent to SharePoint", "ok"];
+  if (sync && sync.status === "error") return ["SharePoint needs attention", "bad"];
+  return ["Saved in the portal", "warn"];
 }
 
 function renderList() {
@@ -532,7 +535,7 @@ function renderList() {
 
   const list = el("div", { className: "list" });
   for (const intake of shown) {
-    const [label, tone] = syncLabel(intake.smartsheet);
+    const [label, tone] = syncLabel(intake);
     list.append(el("button", {
       type: "button",
       className: "intake-row",
@@ -571,7 +574,7 @@ function renderDetail() {
     return root;
   }
 
-  const [label, tone] = syncLabel(intake.smartsheet);
+  const [label, tone] = syncLabel(intake);
   root.append(el("div", { className: "toolbar no-print" }, [
     el("div", {}, [
       el("h2", {}, [intake.summary?.name || "Intake"]),
@@ -580,8 +583,8 @@ function renderDetail() {
     el("span", { className: tone === "ok" ? "pill" : `pill ${tone === "bad" ? "bad" : "warn"}` }, [label]),
   ]));
 
-  if (intake.smartsheet?.detail) {
-    root.append(el("p", { className: "note no-print" }, [intake.smartsheet.detail]));
+  if (intake.sharepoint?.detail) {
+    root.append(el("p", { className: "note no-print" }, [intake.sharepoint.detail]));
   }
 
   for (const section of FORM) {

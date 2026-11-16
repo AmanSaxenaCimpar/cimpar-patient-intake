@@ -109,6 +109,81 @@ def write_intakes(items: list) -> None:
     INTAKES_PATH.write_text(json.dumps(items, indent=2), encoding="utf-8")
 
 
+BOOL_FIELDS = {
+    "hipaaAcknowledged",
+    "consentToTreatment",
+    "assignmentOfBenefits",
+    "financialPolicyAgreed",
+    "responsibleForCharges",
+    "releaseOfInformation",
+    "telehealthConsent",
+}
+DATE_FIELDS = {
+    "dateOfBirth",
+    "policyHolderDob",
+    "consentDateOfBirth",
+    "consentDate",
+    "financialDateOfBirth",
+    "financialDate",
+    "relatedEntitiesDate",
+}
+
+
+def sharepoint_column(key: str) -> str:
+    return key[:1].upper() + key[1:]
+
+
+def sharepoint_url() -> str:
+    return os.environ.get("SHAREPOINT_INTAKE_URL", "").strip()
+
+
+def sharepoint_body(record: dict) -> dict:
+    fields = record.get("fields") or {}
+    body = {
+        "Title": str(fields.get("patientName") or "").strip() or "Patient intake",
+        "IntakeId": record.get("id") or "",
+        "Form": record.get("form") or FORM_SOURCE,
+        "SubmittedAt": record.get("createdAt") or "",
+    }
+    for key in COLUMN_LABELS:
+        column = sharepoint_column(key)
+        value = fields.get(key)
+        if key in BOOL_FIELDS:
+            body[column] = bool(value)
+        elif key in DATE_FIELDS:
+            text = str(value or "").strip()
+            if text:
+                body[column] = text
+        else:
+            body[column] = cell_value(value)
+    return body
+
+
+def sync_sharepoint(record: dict) -> dict:
+    url = sharepoint_url()
+    if not url.startswith("https://"):
+        return {"status": "skipped", "detail": "SharePoint is not configured."}
+    request = Request(
+        url,
+        data=json.dumps(sharepoint_body(record)).encode("utf-8"),
+        method="POST",
+    )
+    request.add_header("Content-Type", "application/json")
+    try:
+        with urlopen(request, timeout=60) as response:
+            response.read()
+            status = response.status
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        detail = " ".join(detail.split())[:240]
+        return {"status": "error", "detail": f"SharePoint rejected the intake ({error.code}). {detail}"}
+    except (URLError, TimeoutError) as error:
+        return {"status": "error", "detail": f"Could not reach SharePoint: {error}"}
+    if status not in (200, 202):
+        return {"status": "error", "detail": f"SharePoint returned status {status}."}
+    return {"status": "synced", "detail": "Item created in the Patient Intake list."}
+
+
 def smartsheet_settings() -> tuple[str, str]:
     token = os.environ.get("SMARTSHEET_ACCESS_TOKEN", "").strip()
     sheet_id = os.environ.get("SMARTSHEET_SHEET_ID", "").strip()
@@ -247,6 +322,7 @@ def public_record(record: dict) -> dict:
         "form": record.get("form") or FORM_SOURCE,
         "createdAt": record.get("createdAt"),
         "updatedAt": record.get("updatedAt"),
+        "sharepoint": record.get("sharepoint") or {"status": "skipped", "detail": ""},
         "smartsheet": record.get("smartsheet") or {"status": "skipped", "detail": ""},
         "summary": {
             "name": str(fields.get("patientName", "")).strip(),
@@ -276,7 +352,13 @@ class IntakeHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/status":
             token, sheet_id = smartsheet_settings()
-            self.send_json(200, {"smartsheetConfigured": bool(token and sheet_id)})
+            self.send_json(
+                200,
+                {
+                    "smartsheetConfigured": bool(token and sheet_id),
+                    "sharepointConfigured": sharepoint_url().startswith("https://"),
+                },
+            )
             return
         if path == "/api/intakes":
             with LOCK:
@@ -347,6 +429,7 @@ class IntakeHandler(SimpleHTTPRequestHandler):
                     "updatedAt": now_iso(),
                     "fields": fields,
                 }
+                record["sharepoint"] = sync_sharepoint(record)
                 record["smartsheet"] = sync_smartsheet(record)
                 items.append(record)
             else:
@@ -357,6 +440,7 @@ class IntakeHandler(SimpleHTTPRequestHandler):
                 record["fields"] = fields
                 record["form"] = FORM_SOURCE
                 record["updatedAt"] = now_iso()
+                record["sharepoint"] = sync_sharepoint(record)
                 record["smartsheet"] = sync_smartsheet(record)
             write_intakes(items)
         self.send_json(200, {"intake": public_record(record)})
@@ -385,11 +469,13 @@ def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), IntakeHandler)
     shown_host = "127.0.0.1" if HOST in {"0.0.0.0", "::"} else HOST
     print(f"Patient intake portal: http://{shown_host}:{PORT}")
+    if sharepoint_url().startswith("https://"):
+        print("SharePoint sync is on.")
+    else:
+        print("SharePoint sync is off until SHAREPOINT_INTAKE_URL is set.")
     token, sheet_id = smartsheet_settings()
     if token and sheet_id:
         print("Smartsheet sync is on.")
-    else:
-        print("Smartsheet sync is off. Intakes are saved in data/intakes.json.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
